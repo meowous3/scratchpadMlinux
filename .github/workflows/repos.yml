@@ -79,17 +79,21 @@ jobs:
       - name: apt
         run: |
           B=dists/stable/main/binary-amd64
-          mkdir -p site/deb/pool site/deb/$B/by-hash/SHA256
+          mkdir -p site/deb/pool site/deb/$B/by-hash/SHA256 site/deb/$B/by-hash/SHA512
           # every kept release's .deb is served from here: apt cannot fetch from another address
           for tag in $(cat used); do cp dl/$tag/melo_*_amd64.deb site/deb/pool/; done
           cd site/deb
           apt-ftparchive packages pool > $B/Packages
           gzip -9kf $B/Packages
-          for f in Packages Packages.gz; do cp $B/$f "$B/by-hash/SHA256/$(sha256sum $B/$f | cut -d' ' -f1)"; done
+          # apt asks by the strongest hash Release lists: SHA512, then SHA256
+          for f in Packages Packages.gz; do
+            cp $B/$f "$B/by-hash/SHA256/$(sha256sum $B/$f | cut -d' ' -f1)"
+            cp $B/$f "$B/by-hash/SHA512/$(sha512sum $B/$f | cut -d' ' -f1)"
+          done
           # the previous indexes stay fetchable by hash, for a client holding the old InRelease
           curl -fsSL "$BASE/deb/dists/stable/InRelease" 2>/dev/null \
-            | awk '/^SHA256:/{s=1;next} /^[A-Za-z]/{s=0} s && $3 ~ /^main\/binary-amd64\/Packages/ {print $1}' \
-            | while read -r h; do curl -fsSLo "$B/by-hash/SHA256/$h" "$BASE/deb/$B/by-hash/SHA256/$h" || true; done
+            | awk '/^SHA(256|512):/{a=substr($1,1,length($1)-1);next} /^[A-Za-z]/{a=""} a && $3 ~ /^main\/binary-amd64\/Packages/ {print a, $1}' \
+            | while read -r a h; do curl -fsSLo "$B/by-hash/$a/$h" "$BASE/deb/$B/by-hash/$a/$h" || true; done
           apt-ftparchive -o APT::FTPArchive::Release::Origin=melo \
             -o APT::FTPArchive::Release::Label=melo -o APT::FTPArchive::Release::Suite=stable \
             -o APT::FTPArchive::Release::Codename=stable -o APT::FTPArchive::Release::Architectures=amd64 \
