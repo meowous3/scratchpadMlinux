@@ -463,10 +463,9 @@ jobs:
           if [ "$KIND" = alpha ]; then export MELO_PKG_VERSION="$v"
           else export MELO_PKG_VERSION="$v+git$(date -u +%Y%m%d).${GITHUB_SHA::7}"; fi
           for p in rpm deb archlinux; do ./nfpm package -f packaging/nfpm.yaml -p $p -t .; done
-          mv melo-*.rpm melo-x86_64.rpm
-          mv melo_*.deb melo-amd64.deb
+          # deb and rpm keep nfpm's versioned names: deb-get reads the version from them
           mv melo-*.pkg.tar.zst melo-x86_64.pkg.tar.zst
-          du -m melo-x86_64.AppImage melo-lite-x86_64.AppImage melo-x86_64.rpm melo-amd64.deb melo-x86_64.pkg.tar.zst
+          du -m melo-x86_64.AppImage melo-lite-x86_64.AppImage melo-*.rpm melo_*.deb melo-x86_64.pkg.tar.zst
 
       - name: Sources
         run: |
@@ -480,8 +479,8 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           files="melo-x86_64.AppImage melo-x86_64.AppImage.zsync
-                 melo-lite-x86_64.AppImage melo-lite-x86_64.AppImage.zsync melo-x86_64.rpm
-                 melo-amd64.deb melo-x86_64.pkg.tar.zst melo-sources.tar"
+                 melo-lite-x86_64.AppImage melo-lite-x86_64.AppImage.zsync
+                 $(echo melo-*.rpm melo_*.deb) melo-x86_64.pkg.tar.zst melo-sources.tar"
           if [ "$KIND" = alpha ]; then
             gh release create "$GITHUB_REF_NAME" --draft --verify-tag \
               --title "Alpha ${GITHUB_REF_NAME#alpha-}" --notes "" $files
@@ -493,5 +492,10 @@ jobs:
             else
               gh release create nightly --prerelease --verify-tag --title "Nightly" --notes "$notes"
             fi
+            # each nightly's deb and rpm have new names: upload, then remove the previous ones
+            old=$(gh release view nightly --json assets -q '.assets[].name' | grep -E '\.(deb|rpm)$' || true)
             gh release upload nightly $files --clobber
+            for a in $old; do
+              case " $(echo $files) " in *" $a "*) ;; *) gh release delete-asset nightly "$a" -y ;; esac
+            done
           fi
