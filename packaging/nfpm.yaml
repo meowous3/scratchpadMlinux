@@ -119,3 +119,6 @@ deb:
   compression: xz
 rpm:
   compression: xz
+  # signed when the release workflow provides the key; unsigned otherwise
+  signature:
+    key_file: ${MELO_SIGNING_KEY_FILE}
