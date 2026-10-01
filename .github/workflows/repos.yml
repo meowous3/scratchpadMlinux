@@ -1,0 +1,195 @@
+name: Package repositories
+
+# apt, dnf, zypper and pacman repositories on GitHub Pages, rebuilt from the published
+# releases whenever one is published. Signed with the PACKAGE_SIGNING_KEY secret
+# (an armored private GPG key), which also signs the .rpm (release.yml); its
+# public half is published beside them.
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: pages
+  cancel-in-progress: false
+
+jobs:
+  # A release run is on the tag, which Pages refuses to deploy from, and an old
+  # tag carries an old copy of this file: hand over to the default branch.
+  relay:
+    if: github.event_name == 'release'
+    runs-on: ubuntu-24.04
+    permissions:
+      actions: write
+    steps:
+      - env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh workflow run repos.yml -R "$GITHUB_REPOSITORY" --ref "${{ github.event.repository.default_branch }}"
+
+  build:
+    if: github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      pages: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+      SIGNING_KEY: ${{ secrets.PACKAGE_SIGNING_KEY }}
+    steps:
+      - id: pages
+        uses: actions/configure-pages@v5
+
+      - name: Tools
+        run: |
+          sudo apt-get update -q
+          sudo apt-get install -y --no-install-recommends apt-utils createrepo-c
+          echo "BASE=${{ steps.pages.outputs.base_url }}" >> "$GITHUB_ENV"
+
+      - name: Signing key
+        run: |
+          [ -n "$SIGNING_KEY" ] || { echo "PACKAGE_SIGNING_KEY is not set"; exit 1; }
+          echo "$SIGNING_KEY" | gpg --batch --import
+          FPR=$(gpg --list-secret-keys --with-colons | awk -F: '/^fpr/ {print $10; exit}')
+          echo "FPR=$FPR" >> "$GITHUB_ENV"
+          mkdir -p site
+          gpg --armor --export "$FPR" > site/melo.asc
+
+      - name: Packages from the published releases
+        run: |
+          # newest first; drafts and the nightly are not releases anyone installs from
+          gh release list -R "$GITHUB_REPOSITORY" --exclude-drafts --exclude-pre-releases \
+            --limit 20 --json tagName --jq '.[].tagName' > tags
+          mkdir -p dl
+          n=0
+          while read -r tag; do
+            mkdir -p "dl/$tag"
+            gh release download "$tag" -R "$GITHUB_REPOSITORY" -D "dl/$tag" \
+              -p 'melo_*_amd64.deb' -p 'melo-*.x86_64.rpm' -p 'melo-x86_64.pkg.tar.zst' || true
+            # releases from before the versioned names have no repository form
+            ls "dl/$tag"/melo_*_amd64.deb >/dev/null 2>&1 || { rm -rf "dl/$tag"; continue; }
+            echo "$tag" >> used
+            n=$((n + 1)); [ $n -ge 2 ] && break
+          done < tags
+          [ -s used ] || { echo "no published release has versioned packages"; exit 1; }
+          cat used
+
+      - name: apt
+        run: |
+          B=dists/stable/main/binary-amd64
+          mkdir -p site/deb/pool site/deb/$B/by-hash/SHA256
+          # every kept release's .deb is served from here: apt cannot fetch from another address
+          for tag in $(cat used); do cp dl/$tag/melo_*_amd64.deb site/deb/pool/; done
+          cd site/deb
+          apt-ftparchive packages pool > $B/Packages
+          gzip -9kf $B/Packages
+          for f in Packages Packages.gz; do cp $B/$f "$B/by-hash/SHA256/$(sha256sum $B/$f | cut -d' ' -f1)"; done
+          # the previous indexes stay fetchable by hash, for a client holding the old InRelease
+          curl -fsSL "$BASE/deb/dists/stable/InRelease" 2>/dev/null \
+            | awk '/^SHA256:/{s=1;next} /^[A-Za-z]/{s=0} s && $3 ~ /^main\/binary-amd64\/Packages/ {print $1}' \
+            | while read -r h; do curl -fsSLo "$B/by-hash/SHA256/$h" "$BASE/deb/$B/by-hash/SHA256/$h" || true; done
+          apt-ftparchive -o APT::FTPArchive::Release::Origin=melo \
+            -o APT::FTPArchive::Release::Label=melo -o APT::FTPArchive::Release::Suite=stable \
+            -o APT::FTPArchive::Release::Codename=stable -o APT::FTPArchive::Release::Architectures=amd64 \
+            -o APT::FTPArchive::Release::Components=main -o APT::FTPArchive::Release::Acquire-By-Hash=yes \
+            release dists/stable > ../Release
+          mv ../Release dists/stable/Release   # written outside, or it lists itself
+          gpg --batch --yes -u "$FPR" --clearsign -o dists/stable/InRelease dists/stable/Release
+          gpg --batch --yes -u "$FPR" -abs -o dists/stable/Release.gpg dists/stable/Release
+
+      - name: dnf
+        run: |
+          # metadata only: each package is fetched from its release, xml:base + "<tag>/<file>"
+          mkdir -p rpmtree site/rpm/repodata
+          for tag in $(cat used); do
+            ls dl/$tag/melo-*.x86_64.rpm >/dev/null 2>&1 || continue
+            mkdir -p "rpmtree/$tag"; cp dl/$tag/melo-*.x86_64.rpm "rpmtree/$tag/"
+          done
+          # the previous metadata files stay, for a client holding the old repomd.xml
+          curl -fsSL "$BASE/rpm/repodata/repomd.xml" 2>/dev/null | grep -o 'repodata/[^"]*' \
+            | while read -r f; do curl -fsSLo "site/rpm/$f" "$BASE/rpm/$f" || true; done
+          createrepo_c --baseurl "https://github.com/$GITHUB_REPOSITORY/releases/download/" rpmtree
+          cp -r rpmtree/repodata/. site/rpm/repodata/
+          # signed for anyone who sets repo_gpgcheck=1; off by default, as dnf5 reports the
+          # key missing on the first refresh before it imports it
+          gpg --batch --yes -u "$FPR" --armor --detach-sign -o site/rpm/repodata/repomd.xml.asc site/rpm/repodata/repomd.xml
+          printf '[melo]\nname=melo\nbaseurl=%s/rpm\nenabled=1\ngpgcheck=1\nrepo_gpgcheck=0\nmetadata_expire=6h\ngpgkey=%s/melo.asc\n' \
+            "$BASE" "$BASE" > site/rpm/melo.repo
+
+      - name: zypper
+        run: |
+          # zypper ignores xml:base, so the newest .rpm is served from here
+          tag=; for t in $(cat used); do ls dl/$t/melo-*.x86_64.rpm >/dev/null 2>&1 && { tag=$t; break; }; done
+          [ -n "$tag" ] || { echo "no published release has an rpm"; exit 1; }
+          mkdir -p susetree/$tag site/suse/repodata
+          cp dl/$tag/melo-*.x86_64.rpm susetree/$tag/
+          cp -r susetree/$tag site/suse/
+          curl -fsSL "$BASE/suse/repodata/repomd.xml" 2>/dev/null | grep -o 'repodata/[^"]*' \
+            | while read -r f; do curl -fsSLo "site/suse/$f" "$BASE/suse/$f" || true; done
+          createrepo_c susetree
+          cp -r susetree/repodata/. site/suse/repodata/
+          gpg --batch --yes -u "$FPR" --armor --detach-sign -o site/suse/repodata/repomd.xml.asc site/suse/repodata/repomd.xml
+          cp site/melo.asc site/suse/repodata/repomd.xml.key
+
+      - name: pacman
+        run: |
+          # the newest release that has one; a repository without it would drop melo for every Arch user
+          f=; for tag in $(cat used); do [ -f "dl/$tag/melo-x86_64.pkg.tar.zst" ] && { f=dl/$tag/melo-x86_64.pkg.tar.zst; break; }; done
+          [ -n "$f" ] || { echo "no published release has an Arch package"; exit 1; }
+          mkdir -p site/arch
+          # under its versioned name: pacman caches by file name
+          name=$(tar -xOf "$f" .PKGINFO --zstd | awk -F' = ' '$1=="pkgver"{print "melo-" $2 "-x86_64.pkg.tar.zst"}')
+          cp "$f" "site/arch/$name"
+          gpg --batch --yes -u "$FPR" --detach-sign -o "site/arch/$name.sig" "site/arch/$name"
+          gpg --armor --export-secret-keys "$FPR" > key.asc
+          docker run --rm -v "$PWD/site/arch:/repo" -v "$PWD/key.asc:/key.asc:ro" archlinux:latest bash -c "
+            gpg --batch --import /key.asc >/dev/null 2>&1
+            cd /repo && repo-add --sign --key $FPR melo.db.tar.gz $name"
+          rm -f key.asc
+          sudo chown -R "$USER" site/arch
+          ls -la site/arch
+
+      - name: Setup page
+        run: |
+          tag=$(head -1 used)
+          DL="https://github.com/$GITHUB_REPOSITORY/releases/download/$tag"
+          DEB=$(basename dl/$tag/melo_*_amd64.deb); RPM=$(basename dl/$tag/melo-*.x86_64.rpm)
+          cat > site/index.html <<EOF
+          <!doctype html><meta charset="utf-8"><title>melo packages</title>
+          <h1>melo packages</h1>
+          <p>Signing key: <code>$FPR</code></p>
+          <h2>Ubuntu, Debian, Mint</h2>
+          <pre>curl -fLO $DL/$DEB
+          sudo apt install ./$DEB</pre>
+          <h2>Fedora, RHEL</h2>
+          <pre>sudo dnf install $DL/$RPM</pre>
+          <h2>openSUSE</h2>
+          <pre>sudo rpm --import $BASE/melo.asc
+          sudo zypper install $DL/$RPM</pre>
+          <h2>Arch</h2>
+          <pre>curl -fsSLo /tmp/melo.asc $BASE/melo.asc
+          sudo pacman-key --add /tmp/melo.asc
+          sudo pacman-key --lsign-key $FPR
+          printf '\n[melo]\nServer = $BASE/arch\n' | sudo tee -a /etc/pacman.conf
+          sudo pacman -Syu melo</pre>
+          EOF
+          find site -type f | sort
+
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: site
+
+  deploy:
+    needs: build
+    runs-on: ubuntu-24.04
+    permissions:
+      pages: write
+      id-token: write
+    environment:
+      name: github-pages
+      url: ${{ steps.deploy.outputs.page_url }}
+    steps:
+      - id: deploy
+        uses: actions/deploy-pages@v4
