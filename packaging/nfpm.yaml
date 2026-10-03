@@ -52,8 +52,8 @@ contents:
     dst: /etc/apt/sources.list.d/melo.sources
     type: config
     packager: deb
-  - src: ./pkgrepo/melo.asc
-    dst: /usr/share/keyrings/melo.asc
+  - src: ./pkgrepo/melo-archive-keyring.pgp
+    dst: /usr/share/keyrings/melo-archive-keyring.pgp
     packager: deb
   - src: ./pkgrepo/melo-dnf.repo
     dst: /etc/yum.repos.d/melo.repo
