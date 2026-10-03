@@ -142,7 +142,9 @@ Rectangle {
             width: parent.width
             height: parent.height - y
             clip: true
-            model: panel.queueMode ? Queue : Suggestions
+            // The mini popup's panel holds no rows while the popup is closed: it would
+            // rebuild them on every queue change, ~30 ms on a track change's worst frame.
+            model: panel.miniHost && !panel.visible ? null : panel.queueMode ? Queue : Suggestions
             // the rows a drag passes slide out of its way; the dragged row
             // itself takes its new slot instantly (no `move` transition) —
             // the handler's offset already carries it across the swap
